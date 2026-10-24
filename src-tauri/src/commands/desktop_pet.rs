@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::{
-    AppHandle, Listener, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize, WebviewUrl,
+    AppHandle, Listener, LogicalPosition, LogicalSize, Manager, WebviewUrl,
     WebviewWindowBuilder,
 };
 
@@ -907,7 +907,7 @@ fn rect_inside_any_monitor(
 // --- 命令：宠物悬浮窗口 --------------------------------------------------
 
 /// 显示宠物窗口。全屏透明窗口铺满当前显示器（单屏），宠物在内部自由漫游。
-/// 多屏漫游由前端在检测到宠物跨屏时调用 `move_pet_window_to_monitor` 迁移窗口实现。
+/// 多屏漫游由前端在检测到宠物贴边时调用 `move_pet_window_to_edge_neighbor` 迁移窗口实现。
 ///
 /// 会等待前端「首帧就绪」事件再显示：pet 窗口加载 HTML 时，webview 在解析到内联透明
 /// 样式（index.html 的 html.pet-window）之前会闪现默认白底。这里在 show 前阻塞等待前端
@@ -987,111 +987,196 @@ pub fn set_pet_always_on_top(app: AppHandle, always_on_top: bool) -> Result<(), 
     Ok(())
 }
 
-/// 把宠物窗口迁移到指定显示器并铺满该屏（单屏铺满，跨屏漫游的迁移原语）。
+/// 迁移方向（宠物贴到当前屏哪条边）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrateSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl MigrateSide {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "left" => Some(MigrateSide::Left),
+            "right" => Some(MigrateSide::Right),
+            "top" => Some(MigrateSide::Top),
+            "bottom" => Some(MigrateSide::Bottom),
+            _ => None,
+        }
+    }
+}
+
+/// 在屏列表中找 current 指定侧的相邻屏（AppKit 逻辑坐标：原点左下、y 向上）。
+/// current 为窗口 frame（全屏模式即等于所在屏 frame）。纯函数，便于单测。
+fn find_neighbor_on_side(
+    current: &ScreenLogicalFrame,
+    screens: &[ScreenLogicalFrame],
+    side: MigrateSide,
+) -> Option<ScreenLogicalFrame> {
+    // 垂直方向需有重叠（对 Left/Right），水平方向需有重叠（对 Top/Bottom）。
+    let overlap_y = |s: &ScreenLogicalFrame| {
+        s.origin_y < current.origin_y + current.height - FRAME_TOL
+            && s.origin_y + s.height > current.origin_y + FRAME_TOL
+    };
+    let overlap_x = |s: &ScreenLogicalFrame| {
+        s.origin_x < current.origin_x + current.width - FRAME_TOL
+            && s.origin_x + s.width > current.origin_x + FRAME_TOL
+    };
+    screens
+        .iter()
+        .filter(|s| !same_frame(s, current))
+        .find(|s| match side {
+            MigrateSide::Left => {
+                (s.origin_x + s.width - current.origin_x).abs() <= FRAME_TOL && overlap_y(s)
+            }
+            MigrateSide::Right => {
+                (s.origin_x - (current.origin_x + current.width)).abs() <= FRAME_TOL && overlap_y(s)
+            }
+            MigrateSide::Top => {
+                (s.origin_y + s.height - current.origin_y).abs() <= FRAME_TOL && overlap_x(s)
+            }
+            MigrateSide::Bottom => {
+                (s.origin_y - (current.origin_y + current.height)).abs() <= FRAME_TOL && overlap_x(s)
+            }
+        })
+        .cloned()
+}
+
+/// 两 frame 是否几何相同（同一块屏，窗口全屏铺满时窗口 frame == 屏 frame）。
+fn same_frame(a: &ScreenLogicalFrame, b: &ScreenLogicalFrame) -> bool {
+    (a.origin_x - b.origin_x).abs() < FRAME_TOL
+        && (a.origin_y - b.origin_y).abs() < FRAME_TOL
+        && (a.width - b.width).abs() < FRAME_TOL
+        && (a.height - b.height).abs() < FRAME_TOL
+}
+
+const FRAME_TOL: f64 = 2.0;
+
+/// 跨屏迁移（macOS 专用 AppKit 逻辑坐标实现）。
 ///
-/// macOS 下单个透明窗口无法跨屏渲染（副屏不可见），故采用「单屏铺满 + 跨屏迁移」：
-/// 窗口始终铺满宠物当前所在屏；当宠物走到屏边要进入相邻屏时，前端调用此命令把窗口
-/// 迁移到目标屏。返回新窗口几何（物理 + 逻辑），前端据此重映射宠物坐标，保持视觉连续。
+/// 背景：原实现走 tao 物理坐标 + monitorFromPoint 探测，在缩放主屏（非整数 DPI）+
+/// 混合 DPI 布局下系统性失真：monitorFromPoint 对屏幕外探测点【永不返回】（前端
+/// await 挂死），窗口 set_size(Physical) 在跨 DPI 迁移后 webview DPR 不同步导致
+/// 画布尺寸错乱、宠物在两屏间反复弹跳。
 ///
-/// `target_monitor_name` 为目标显示器名（来自 Tauri availableMonitors 的 Monitor.name）。
-/// 找不到该显示器时回退 `position_fullscreen`（铺满当前屏）。
-#[tauri::command]
-pub fn move_pet_window_to_monitor(
-    app: AppHandle,
-    target_monitor_name: String,
+/// 本实现全程 AppKit 逻辑坐标：读宠物窗口自身 NSWindow frame（唯一可信几何）+
+/// NSScreen 列表 → 纯函数找相邻屏 → NSWindow setFrame 一次原子迁移（位置+尺寸）。
+///
+/// 返回新屏逻辑几何，供前端重映射宠物坐标；无邻屏返回 Err（前端忽略即可）。
+#[cfg(target_os = "macos")]
+fn macos_migrate_to_neighbor(
+    window: &tauri::WebviewWindow,
+    side: MigrateSide,
 ) -> Result<WindowGeometry, String> {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSRect;
+
+    unsafe {
+        let ns_win = window
+            .ns_window()
+            .map_err(|e| format!("获取 NSWindow 失败: {}", e))?;
+        if ns_win.is_null() {
+            return Err("NSWindow 为空".to_string());
+        }
+        let ns_win = ns_win as *mut AnyObject;
+        let cur: NSRect = msg_send![ns_win, frame];
+
+        let (_, screens) = macos_cursor_and_screens().ok_or("读取屏幕信息失败")?;
+        let current = ScreenLogicalFrame {
+            origin_x: cur.origin.x,
+            origin_y: cur.origin.y,
+            width: cur.size.width,
+            height: cur.size.height,
+        };
+        let target = find_neighbor_on_side(&current, &screens, side)
+            .ok_or_else(|| "该侧无相邻显示器".to_string())?;
+
+        // NSWindow setFrame:display: 一次设置位置 + 尺寸（逻辑坐标，原子）。
+        let new_frame = NSRect::new(
+            objc2_foundation::NSPoint::new(target.origin_x, target.origin_y),
+            objc2_foundation::NSSize::new(target.width, target.height),
+        );
+        let _: () = msg_send![ns_win, setFrame: new_frame, display: true];
+
+        Ok(WindowGeometry {
+            origin_x: target.origin_x,
+            origin_y: target.origin_y,
+            width: target.width,
+            height: target.height,
+            logical_width: target.width,
+            logical_height: target.height,
+            scale_factor: 1.0, // 全程逻辑坐标，前端无需再做物理换算
+        })
+    }
+}
+
+/// 跨屏迁移命令：把宠物窗口迁到当前屏指定侧的相邻显示器（全屏铺满）。
+#[tauri::command]
+pub fn move_pet_window_to_edge_neighbor(
+    app: AppHandle,
+    side: String,
+) -> Result<WindowGeometry, String> {
+    let side = MigrateSide::from_str(&side).ok_or_else(|| format!("未知方向: {}", side))?;
     let window = app
         .get_webview_window(PET_WINDOW_LABEL)
         .ok_or_else(|| "宠物窗口不存在".to_string())?;
 
-    let monitors = window
-        .available_monitors()
-        .map_err(|e| format!("获取显示器列表失败: {}", e))?;
+    #[cfg(target_os = "macos")]
+    return macos_migrate_to_neighbor(&window, side);
 
-    // 按名匹配目标显示器。
-    let target = monitors
-        .into_iter()
-        .find(|m| m.name().map(|n| *n == target_monitor_name).unwrap_or(false));
-    // 找不到 → 回退当前屏铺满。
-    let monitor = match target {
-        Some(m) => m,
-        None => {
-            let (origin_x, origin_y, logical_w, logical_h, scale) =
-                position_fullscreen_and_report(&window)?;
-            return Ok(WindowGeometry {
-                origin_x,
-                origin_y,
-                width: logical_w * scale,
-                height: logical_h * scale,
-                logical_width: logical_w,
-                logical_height: logical_h,
-                scale_factor: scale,
-            });
-        }
-    };
-
-    let scale = monitor.scale_factor();
-    let pos = monitor.position();
-    let size = monitor.size();
-    let origin_x = pos.x as f64;
-    let origin_y = pos.y as f64;
-    let width = size.width as f64;
-    let height = size.height as f64;
-    let logical_width = width / scale;
-    let logical_height = height / scale;
-
-    // 迁移：定位到目标屏物理原点，尺寸设为目标屏物理全尺寸。
-    window
-        .set_position(PhysicalPosition::new(origin_x, origin_y))
-        .map_err(|e| format!("迁移宠物窗口定位失败: {}", e))?;
-    window
-        .set_size(PhysicalSize::new(width, height))
-        .map_err(|e| format!("迁移宠物窗口尺寸失败: {}", e))?;
-
-    Ok(WindowGeometry {
-        origin_x,
-        origin_y,
-        width,
-        height,
-        logical_width,
-        logical_height,
-        scale_factor: scale,
-    })
-}
-
-/// 铺满当前屏（position_fullscreen）并返回其几何信息（物理原点 + 逻辑尺寸 + scale）。
-/// 供 move_pet_window_to_monitor 的回退路径复用。
-fn position_fullscreen_and_report(
-    window: &tauri::WebviewWindow,
-) -> Result<(f64, f64, f64, f64, f64), String> {
-    let monitor = window
-        .current_monitor()
-        .map_err(|e| format!("获取当前显示器失败: {}", e))?
-        .or_else(|| {
-            window
-                .primary_monitor()
-                .map_err(|e| format!("获取主显示器失败: {}", e))
-                .ok()
-                .flatten()
+    // 非 macOS：tao 物理坐标可信，同套邻接判断（y 翻转为向上原点约定后复用）。
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mon = window
+            .current_monitor()
+            .map_err(|e| format!("获取当前显示器失败: {}", e))?
+            .ok_or_else(|| "未找到当前显示器".to_string())?;
+        // tao（Win/Linux）：position 为顶左原点物理坐标（y 向下）。翻转成 y 向上：
+        // origin_y' = -(origin_y + height)，邻接判断与 AppKit 约定一致。
+        let flip = |x: i32, y: i32, w: u32, h: u32| ScreenLogicalFrame {
+            origin_x: x as f64,
+            origin_y: -((y + h as i32) as f64),
+            width: w as f64,
+            height: h as f64,
+        };
+        let cur_pos = mon.position();
+        let cur_size = mon.size();
+        let current = flip(cur_pos.x, cur_pos.y, cur_size.width, cur_size.height);
+        let all = window
+            .available_monitors()
+            .map_err(|e| format!("获取显示器列表失败: {}", e))?;
+        let screens: Vec<ScreenLogicalFrame> = all
+            .iter()
+            .map(|m| {
+                let p = m.position();
+                let s = m.size();
+                flip(p.x, p.y, s.width, s.height)
+            })
+            .collect();
+        let target = find_neighbor_on_side(&current, &screens, side)
+            .ok_or_else(|| "该侧无相邻显示器".to_string())?;
+        // 翻回 y 向下物理坐标并迁移。
+        let phys_y = (-(target.origin_y) - target.height) as i32;
+        window
+            .set_position(tauri::PhysicalPosition::new(target.origin_x as i32, phys_y))
+            .map_err(|e| format!("迁移窗口定位失败: {}", e))?;
+        window
+            .set_size(tauri::PhysicalSize::new(target.width as u32, target.height as u32))
+            .map_err(|e| format!("迁移窗口尺寸失败: {}", e))?;
+        let scale = window.scale_factor().map_err(|e| format!("获取 scale 失败: {}", e))?;
+        Ok(WindowGeometry {
+            origin_x: target.origin_x,
+            origin_y: target.origin_y,
+            width: target.width,
+            height: target.height,
+            logical_width: target.width / scale,
+            logical_height: target.height / scale,
+            scale_factor: scale,
         })
-        .ok_or_else(|| "未找到可用显示器".to_string())?;
-
-    let scale = monitor.scale_factor();
-    let pos = monitor.position();
-    let size = monitor.size();
-    let origin_x = pos.x as f64;
-    let origin_y = pos.y as f64;
-    let logical_w = size.width as f64 / scale;
-    let logical_h = size.height as f64 / scale;
-
-    window
-        .set_position(LogicalPosition::new(origin_x, origin_y))
-        .map_err(|e| format!("定位全屏宠物窗口失败: {}", e))?;
-    window
-        .set_size(LogicalSize::new(logical_w, logical_h))
-        .map_err(|e| format!("设置全屏宠物窗口尺寸失败: {}", e))?;
-
-    Ok((origin_x, origin_y, logical_w, logical_h, scale))
+    }
 }
 
 /// 光标在宠物窗口内的局部 CSS px 坐标（顶左原点）。
@@ -1110,7 +1195,6 @@ pub struct CursorLocal {
 /// 屏幕逻辑几何（AppKit 全局坐标：主屏左下为原点，y 向上，单位 points）。 */
 #[derive(Clone, Debug)]
 struct ScreenLogicalFrame {
-    name: String,
     origin_x: f64,
     origin_y: f64,
     width: f64,
@@ -1122,15 +1206,13 @@ fn cursor_local_on_frame(cursor_x: f64, cursor_y: f64, f: &ScreenLogicalFrame) -
     (cursor_x - f.origin_x, (f.origin_y + f.height) - cursor_y)
 }
 
-/// macOS：读全局光标逻辑坐标 + 各屏逻辑 frame（名称与 tauri Monitor::name 一致，
-/// 均为 NSScreen.localizedName）。
+/// macOS：读全局光标逻辑坐标 + 各屏逻辑 frame。
 #[cfg(target_os = "macos")]
 fn macos_cursor_and_screens() -> Option<((f64, f64), Vec<ScreenLogicalFrame>)> {
     use objc2::class;
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
     use objc2_foundation::{NSPoint, NSRect};
-    use std::ffi::{c_char, CStr};
 
     unsafe {
         let pt: NSPoint = msg_send![class!(NSEvent), mouseLocation];
@@ -1147,19 +1229,7 @@ fn macos_cursor_and_screens() -> Option<((f64, f64), Vec<ScreenLogicalFrame>)> {
                 continue;
             }
             let frame: NSRect = msg_send![screen, frame];
-            let name_obj: *mut AnyObject = msg_send![screen, localizedName];
-            let name = if name_obj.is_null() {
-                String::new()
-            } else {
-                let utf8: *const c_char = msg_send![name_obj, UTF8String];
-                if utf8.is_null() {
-                    String::new()
-                } else {
-                    CStr::from_ptr(utf8).to_string_lossy().into_owned()
-                }
-            };
             frames.push(ScreenLogicalFrame {
-                name,
                 origin_x: frame.origin.x,
                 origin_y: frame.origin.y,
                 width: frame.size.width,
@@ -1172,21 +1242,23 @@ fn macos_cursor_and_screens() -> Option<((f64, f64), Vec<ScreenLogicalFrame>)> {
 
 #[tauri::command]
 pub fn get_cursor_local(app: AppHandle) -> Result<CursorLocal, String> {
-    let window = app
-        .get_webview_window(PET_WINDOW_LABEL)
-        .ok_or_else(|| "宠物窗口不存在".to_string())?;
-
     #[cfg(target_os = "macos")]
     {
+        let _ = &app; // 窗口几何不参与 macOS 路径（纯光标 + 屏列表换算）
         let (cursor, frames) = macos_cursor_and_screens().ok_or("读取鼠标/屏幕信息失败")?;
-        // 宠物窗口所在屏（名称匹配 NSScreen），无名/不匹配时退回第一块屏。
-        let current_name = window
-            .current_monitor()
-            .map_err(|e| format!("获取当前显示器失败: {}", e))?
-            .and_then(|m| m.name().map(|n| n.to_string()));
-        let frame = current_name
-            .as_deref()
-            .and_then(|name| frames.iter().find(|f| f.name == name))
+        // 按光标所在屏换算局部坐标（不按窗口所在屏）：
+        //  - tauri Monitor::name（tao）返回 "Monitor #<型号号>"，与 NSScreen.localizedName
+        //    （可能为空串，如实测副屏）无法匹配，按名找窗口所在屏不可行；
+        //  - 光标不在宠物窗口所在屏时，算出的局部坐标必落在窗口画布外 → 悬停判定为
+        //    false → 穿透，行为恰好正确（宠物不在光标下）。
+        let frame = frames
+            .iter()
+            .find(|f| {
+                cursor.0 >= f.origin_x
+                    && cursor.0 < f.origin_x + f.width
+                    && cursor.1 >= f.origin_y
+                    && cursor.1 < f.origin_y + f.height
+            })
             .or_else(|| frames.first())
             .ok_or("未找到可用显示器")?;
         let (x, y) = cursor_local_on_frame(cursor.0, cursor.1, frame);
@@ -1196,6 +1268,9 @@ pub fn get_cursor_local(app: AppHandle) -> Result<CursorLocal, String> {
     // Windows/Linux：tao 的 cursor_position 为正确的物理坐标，按窗口原点 + scale 换算即可。
     #[cfg(not(target_os = "macos"))]
     {
+        let window = app
+            .get_webview_window(PET_WINDOW_LABEL)
+            .ok_or_else(|| "宠物窗口不存在".to_string())?;
         let scale = window.scale_factor().map_err(|e| format!("获取 scale 失败: {}", e))?;
         if scale <= 0.0 {
             return Err("非法 scale factor".to_string());
@@ -1209,13 +1284,18 @@ pub fn get_cursor_local(app: AppHandle) -> Result<CursorLocal, String> {
     }
 }
 
+/// 前端诊断日志透传（开发排查用）：写入应用日志（dev 控制台 / tracing 输出）。
+#[tauri::command]
+pub fn debug_log(message: String) {
+    tracing::info!("[Frontend] {}", message);
+}
+
 #[cfg(test)]
 mod cursor_local_tests {
     use super::*;
 
-    fn frame(name: &str, x: f64, y: f64, w: f64, h: f64) -> ScreenLogicalFrame {
+    fn frame(_name: &str, x: f64, y: f64, w: f64, h: f64) -> ScreenLogicalFrame {
         ScreenLogicalFrame {
-            name: name.to_string(),
             origin_x: x,
             origin_y: y,
             width: w,
@@ -1250,6 +1330,65 @@ mod cursor_local_tests {
         let sec = frame("DELL", 1280.0, -184.0, 1920.0, 1200.0);
         let (_, ly) = cursor_local_on_frame(1500.0, -300.0, &sec);
         assert!(ly > 1200.0, "ly={ly}");
+    }
+
+    /// 运行时探针：打印真实光标逻辑坐标 + 各屏逻辑 frame（--nocapture 观察）。
+    #[test]
+    fn probe_runtime_screen_state() {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some((cursor, frames)) = macos_cursor_and_screens() {
+                println!("cursor logical (AppKit): {:?}", cursor);
+                for f in &frames {
+                    println!(
+                        "screen origin=({},{}) size={}x{}",
+                        f.origin_x, f.origin_y, f.width, f.height
+                    );
+                }
+            } else {
+                println!("macos_cursor_and_screens returned None");
+            }
+        }
+    }
+
+    // --- 邻屏查找（真实混合 DPI 布局：主屏 1470x956 @ (0,0)，副屏 1920x1200 @ (-1920,-208) 左置）
+    fn f(x: f64, y: f64, w: f64, h: f64) -> ScreenLogicalFrame {
+        ScreenLogicalFrame { origin_x: x, origin_y: y, width: w, height: h }
+    }
+
+    #[test]
+    fn neighbor_found_on_left_of_main() {
+        let main = f(0.0, 0.0, 1470.0, 956.0);
+        let sec = f(-1920.0, -208.0, 1920.0, 1200.0);
+        let screens = vec![main.clone(), sec.clone()];
+        let found = find_neighbor_on_side(&main, &screens, MigrateSide::Left).unwrap();
+        assert_eq!(found.origin_x, sec.origin_x);
+    }
+
+    #[test]
+    fn no_neighbor_on_right_void_of_main() {
+        let main = f(0.0, 0.0, 1470.0, 956.0);
+        let sec = f(-1920.0, -208.0, 1920.0, 1200.0);
+        let screens = vec![main.clone(), sec];
+        assert!(find_neighbor_on_side(&main, &screens, MigrateSide::Right).is_none());
+    }
+
+    #[test]
+    fn neighbor_found_on_right_of_secondary() {
+        let main = f(0.0, 0.0, 1470.0, 956.0);
+        let sec = f(-1920.0, -208.0, 1920.0, 1200.0);
+        let screens = vec![main, sec.clone()];
+        let found = find_neighbor_on_side(&sec, &screens, MigrateSide::Right).unwrap();
+        assert_eq!(found.origin_x, 0.0);
+    }
+
+    #[test]
+    fn no_vertical_neighbor_when_side_by_side() {
+        let main = f(0.0, 0.0, 1470.0, 956.0);
+        let sec = f(-1920.0, -208.0, 1920.0, 1200.0);
+        let screens = vec![main.clone(), sec];
+        assert!(find_neighbor_on_side(&main, &screens, MigrateSide::Top).is_none());
+        assert!(find_neighbor_on_side(&main, &screens, MigrateSide::Bottom).is_none());
     }
 }
 

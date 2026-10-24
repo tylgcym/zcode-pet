@@ -1,32 +1,30 @@
-// 多屏跨屏迁移器（macOS 单屏窗口 + 跨屏迁移方案）。
+// 多屏跨屏迁移器。
 //
-// 背景：macOS 下单个透明窗口无法跨屏渲染（副屏不可见），故窗口恒铺满「宠物当前所在屏」。
-// 本模块检测宠物是否接近当前屏边缘、且边缘外侧存在相邻显示器；若是，调用后端
-// move_pet_window_to_monitor 把窗口迁移到邻屏，并把宠物重定位到邻屏对应边缘内侧，
-// 实现无缝跨屏。
+// 职责分工：前端只做【本地】贴边检测（宠物位置 + 活动边界，零 IPC）；邻屏查找与窗口
+// 迁移全部在 Rust 侧完成（`move_pet_window_to_edge_neighbor`）：
+//   - macOS 用 AppKit 逻辑坐标（NSWindow frame + NSScreen 邻接判断 + setFrame 原子迁移），
+//     不经 tao 物理坐标——tao 在缩放主屏（非整数 DPI）/混合 DPI 布局下换算失真，且
+//     monitorFromPoint 对虚空探测点【永不返回】（旧实现在此挂死）。
+//   - Windows/Linux 用 tao 物理坐标（该平台上正确），同一套邻接判断。
 //
-// 触发条件（关键）：不能等宠物物理坐标真的跨屏——宠物被单屏边界 clamp 钉在当前屏内，
-// 永远不会跨过去。故改为：宠物接近活动边界（距 bounds 边 < EDGE_TRIGGER_PX）且该屏边缘
-// 物理外侧有邻屏时，主动触发迁移。
-//
-// 防反向弹跳：迁移后宠物落在目标屏「进入边缘的相反侧」内侧（如从源屏左出 → 进目标屏右），
-// 且距边缘足够远（inset > padding + EDGE_TRIGGER_PX），确保不会立即又触发反向迁移。
-// 方向相反是因为相邻屏坐标系连续：源屏左边缘紧邻目标屏右边缘。
+// 迁移后把宠物重定位到目标屏「进入侧的相反侧」内侧（inset > PADDING + 触发阈值），
+// 防止立即反向弹跳。
 
-import { availableMonitors, currentMonitor, getCurrentWindow, monitorFromPoint } from '@tauri-apps/api/window'
 import { invoke } from '@tauri-apps/api/core'
 
 import type { PetController } from './PetController'
 
-/** move_pet_window_to_monitor 命令返回的窗口几何（物理 + 逻辑 + scale）。 */
+/** 前端诊断日志透传到应用日志（dev 排查跨屏迁移链路）。 */
+function debugLog(message: string): void {
+  void invoke('debug_log', { message: `[Migrator] ${message}` }).catch(() => {})
+}
+
+/** 迁移命令返回的窗口几何（新屏；width/height 为该平台坐标系的尺寸，logical* 为 CSS px）。 */
 interface WindowGeometry {
-  originX: number
-  originY: number
   width: number
   height: number
   logicalWidth: number
   logicalHeight: number
-  scaleFactor: number
 }
 
 /** 迁移器依赖：拿到宠物位置 + 迁移后重算视口。 */
@@ -35,7 +33,7 @@ export interface MigratorDeps {
   onMigrated: () => void
 }
 
-/** 宠物距活动边界小于该值（逻辑像素）且外侧有邻屏时，触发迁移。 */
+/** 宠物距活动边界小于该值（逻辑像素）时视为贴边。 */
 const EDGE_TRIGGER_PX = 24
 /** 迁移采样间隔（ms）。 */
 const TICK_INTERVAL_MS = 120
@@ -43,19 +41,15 @@ const TICK_INTERVAL_MS = 120
 const MIN_MIGRATE_GAP_MS = 600
 /** 宠物足迹半宽 + 侧边距（与 viewport.ts 的 footprint(72)+SIDE(16) 一致）。 */
 const PADDING = 88
-// ponytail: 显示器数量 TTL 缓存——热插显示器最多延迟 30s 生效；需要即时可改监听 monitor 变化事件
-const MONITOR_COUNT_TTL_MS = 30_000
 
 /**
  * 创建跨屏迁移器。返回 tick()，由引擎 ticker 周期调用（内部按 TICK_INTERVAL_MS 节流）。
  */
 export function createCrossMonitorMigrator(deps: MigratorDeps) {
-  const win = getCurrentWindow()
   let lastTickAt = 0
   let lastMigrateAt = 0
   let migrating = false
-  let monitorCount: number | null = null
-  let monitorCountAt = 0
+  let lastNoNeighborLogAt = 0
 
   async function tick(): Promise<void> {
     if (migrating) return
@@ -66,7 +60,7 @@ export function createCrossMonitorMigrator(deps: MigratorDeps) {
 
     try {
       // 1. 宠物当前画布坐标 + 活动边界（clamp 后的实际可达范围）。
-      //    边缘检测纯本地——绝大多数 tick 宠物在屏幕中部，到此返回，零 IPC。
+      //    贴边检测纯本地——绝大多数 tick 宠物在屏幕中部，到此返回，零 IPC。
       const pos = deps.pet.getSnapshotForMigration()
       const bounds = deps.pet.migrationBounds
       if (!pos || !bounds) return
@@ -77,83 +71,56 @@ export function createCrossMonitorMigrator(deps: MigratorDeps) {
       const atBottomEdge = pos.y >= bounds.maxY - EDGE_TRIGGER_PX
       if (!atLeftEdge && !atRightEdge && !atTopEdge && !atBottomEdge) return
 
-      // 2. 显示器数量（TTL 缓存）：单屏机器贴边也无需任何窗口 IPC。
-      if (monitorCount === null || now - monitorCountAt > MONITOR_COUNT_TTL_MS) {
-        monitorCount = (await availableMonitors()).length
-        monitorCountAt = now
-      }
-      if (monitorCount <= 1) return
+      // 2. 方向：水平优先（多数多屏为左右布局；对边同真不可能，邻角取水平）。
+      const side = atLeftEdge ? 'left' : atRightEdge ? 'right' : atTopEdge ? 'top' : 'bottom'
 
-      // 3. 窗口物理原点 + scale + 当前所在屏。
-      const [origin, winScale, winMonitor] = await Promise.all([
-        win.outerPosition(),
-        win.scaleFactor(),
-        currentMonitor(),
-      ])
-      if (winScale <= 0 || !winMonitor) return
-
-      // 4. 探测当前屏边缘「物理外侧」是否有邻屏。
-      //    探测点必须在当前屏物理边界之外（monLeft-1 等），否则仍在当前屏内。
-      const monPos = winMonitor.position
-      const monSize = winMonitor.size
-      const petPhysX = origin.x + pos.x * winScale
-      const petPhysY = origin.y + pos.y * winScale
-      const probes: Array<{ x: number; y: number }> = []
-      if (atLeftEdge) probes.push({ x: monPos.x - 1, y: petPhysY })
-      if (atRightEdge) probes.push({ x: monPos.x + monSize.width + 1, y: petPhysY })
-      if (atTopEdge) probes.push({ x: petPhysX, y: monPos.y - 1 })
-      if (atBottomEdge) probes.push({ x: petPhysX, y: monPos.y + monSize.height + 1 })
-
-      let targetMonitor = null
-      for (const p of probes) {
-        const m = await monitorFromPoint(p.x, p.y)
-        if (m && m.name !== winMonitor.name) {
-          targetMonitor = m
-          break
-        }
-      }
-      if (!targetMonitor) return // 贴边但外侧无邻屏（屏幕物理边界）。
-
-      // 5. 触发迁移：调后端把窗口迁到邻屏，拿新几何。
+      // 3. Rust 侧完成邻屏查找 + 窗口迁移；无邻屏（虚空边缘）返回 Err，属常态。
       migrating = true
+      let geo: WindowGeometry
       try {
-        const geo = await invoke<WindowGeometry>('move_pet_window_to_monitor', {
-          targetMonitorName: targetMonitor.name,
-        })
-        lastMigrateAt = Date.now()
-
-        // 6. 重定位宠物到目标屏「进入边缘的相反侧」内侧，防反向弹跳。
-        //    inset 须 > PADDING + EDGE_TRIGGER_PX，使 clamp 后位置不再满足 atEdge。
-        const newScale = geo.scaleFactor > 0 ? geo.scaleFactor : winScale
-        const newLogicalW = geo.logicalWidth > 0 ? geo.logicalWidth : geo.width / newScale
-        const newLogicalH = geo.logicalHeight > 0 ? geo.logicalHeight : geo.height / newScale
-        const inset = PADDING + EDGE_TRIGGER_PX + 60
-        const clampX = (x: number) => Math.max(PADDING, Math.min(newLogicalW - PADDING, x))
-        const clampY = (y: number) => Math.max(PADDING, Math.min(newLogicalH - PADDING, y))
-        let newCanvasX: number
-        let newCanvasY: number
-        if (atLeftEdge) {
-          // 源屏左出 → 目标屏右内侧
-          newCanvasX = clampX(newLogicalW - inset)
-          newCanvasY = clampY(pos.y)
-        } else if (atRightEdge) {
-          newCanvasX = clampX(inset)
-          newCanvasY = clampY(pos.y)
-        } else if (atTopEdge) {
-          newCanvasX = clampX(pos.x)
-          newCanvasY = clampY(newLogicalH - inset)
-        } else {
-          newCanvasX = clampX(pos.x)
-          newCanvasY = clampY(inset)
+        geo = await invoke<WindowGeometry>('move_pet_window_to_edge_neighbor', { side })
+      } catch (e) {
+        const msg = String(e)
+        if (now - lastNoNeighborLogAt > 1000) {
+          lastNoNeighborLogAt = now
+          debugLog(`no neighbor side=${side}: ${msg}`)
         }
-
-        deps.pet.dragTo(newCanvasX, newCanvasY)
-        deps.onMigrated()
+        return
       } finally {
         migrating = false
       }
+      lastMigrateAt = Date.now()
+      debugLog(`migrated ${side} -> ${geo.logicalWidth}x${geo.logicalHeight}`)
+
+      // 4. 重定位宠物到目标屏「进入侧的相反侧」内侧，防反向弹跳。
+      //    inset 须 > PADDING + EDGE_TRIGGER_PX，使 clamp 后位置不再满足贴边条件。
+      const w = geo.logicalWidth > 0 ? geo.logicalWidth : geo.width
+      const h = geo.logicalHeight > 0 ? geo.logicalHeight : geo.height
+      const inset = PADDING + EDGE_TRIGGER_PX + 60
+      const clampX = (x: number) => Math.max(PADDING, Math.min(w - PADDING, x))
+      const clampY = (y: number) => Math.max(PADDING, Math.min(h - PADDING, y))
+      let newCanvasX: number
+      let newCanvasY: number
+      if (side === 'left') {
+        // 当前屏左出 → 目标屏右内侧
+        newCanvasX = clampX(w - inset)
+        newCanvasY = clampY(pos.y)
+      } else if (side === 'right') {
+        newCanvasX = clampX(inset)
+        newCanvasY = clampY(pos.y)
+      } else if (side === 'top') {
+        newCanvasX = clampX(pos.x)
+        newCanvasY = clampY(h - inset)
+      } else {
+        newCanvasX = clampX(pos.x)
+        newCanvasY = clampY(inset)
+      }
+
+      deps.pet.dragTo(newCanvasX, newCanvasY)
+      deps.onMigrated()
     } catch (error) {
       migrating = false
+      debugLog(`tick error: ${String(error)}`)
       console.warn('[CrossMonitorMigrator] migrate failed:', error)
     }
   }

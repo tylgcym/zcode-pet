@@ -137,10 +137,12 @@ pub fn run() {
             desktop_pet::hide_pet_window,
             desktop_pet::toggle_pet_window,
             desktop_pet::set_pet_always_on_top,
-            // 多屏漫游：跨屏时迁移窗口到目标显示器
-            desktop_pet::move_pet_window_to_monitor,
+            // 多屏漫游：跨屏时按贴边方向迁移窗口到相邻显示器
+            desktop_pet::move_pet_window_to_edge_neighbor,
             // 点击穿透检测：光标在宠物窗口内的局部坐标（混合 DPI 多屏正确换算）
             desktop_pet::get_cursor_local,
+            // 前端诊断日志透传（开发排查）
+            desktop_pet::debug_log,
             // ZCode hook 联动
             desktop_pet::link_zcode,
             desktop_pet::get_zcode_link_status,
