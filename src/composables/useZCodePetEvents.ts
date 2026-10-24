@@ -23,15 +23,12 @@
  */
 import { onMounted, onUnmounted, ref, type Ref } from 'vue'
 import { listen } from '@tauri-apps/api/event'
-import { invoke } from '@tauri-apps/api/core'
 import { useI18n } from 'vue-i18n'
 import { mapEvent, createNotificationQueue } from '@/modules/desktopPet/notifications'
 import type { NotificationSpec } from '@/modules/desktopPet/notifications'
 import { resolveAction } from '@/modules/desktopPet/engine/actionResolver'
-import { pickTokenCommentary } from '@/modules/desktopPet/tokenCommentary'
 import type { PetApp } from '@/modules/desktopPet/engine'
 import type { ZCodePetEventPayload } from '@/types/zcodeHook'
-import type { TokenStats } from '@/types/tokenStats'
 import { usePetSettingsStore } from '@/stores/petSettings'
 
 /** 单条气泡展示总时长（打字机 + 停留），到点后淡出隐藏并清空队列。 */
@@ -44,37 +41,6 @@ const DISPLAY_MS_PER_CHAR = 70
 const DISPLAY_TOTAL_MAX_MS = 16000
 /** 队列推进间隔（ms）。队列自身时间分辨率为 minDisplayMs（2200ms），250ms 足够。 */
 const TICK_INTERVAL_MS = 250
-
-/**
- * 格式化 token 数为简短可读形式（适合气泡展示）。
- *
- * < 1万 → 原始数字千分位；1万~1亿 → "X.X万"；≥1亿 → "X.X亿"。
- */
-function formatTokens(n: number): string {
-  if (n >= 100_000_000) return (n / 100_000_000).toFixed(1) + '亿'
-  if (n >= 10_000) return (n / 10_000).toFixed(1) + '万'
-  return n.toLocaleString()
-}
-
-/**
- * 异步追加今日 token 用量统计行到气泡尾部（Stop 事件专用）。
- *
- * 查询失败时静默忽略——token 统计是非关键增强功能。
- */
-async function appendTokenLine(app: PetApp, t: ReturnType<typeof useI18n>['t']): Promise<void> {
-  try {
-    const stats = await invoke<TokenStats | null>('get_zcode_token_stats')
-    if (stats && stats.todayTotalTokens > 0) {
-      const base = `\n📊 ${t('ui.stats.today')}: ${formatTokens(stats.todayTotalTokens)} · ${stats.todayCalls}${t('ui.stats.calls')}`
-      // 按用量档位挑一句调皮调侃拼到统计行后面。
-      const comment = pickTokenCommentary(stats.todayTotalTokens, stats.todayCalls)
-      app.appendChatToken(`${base}  ${comment}`)
-    }
-  } catch {
-    // token 统计非关键，静默忽略
-  }
-  app.endChat()
-}
 
 /**
  * 监听 ZCode 事件并驱动宠物动画 + 对话气泡。
@@ -142,12 +108,7 @@ export function useZCodePetEvents(petAppRef: Ref<PetApp | null>) {
             clearInterval(typewriterTimer)
             typewriterTimer = null
           }
-          // Stop 事件：打字机结束后异步追加今日 token 用量行（非关键，失败静默）。
-          if (spec.appendTokenStats) {
-            void appendTokenLine(app, t)
-          } else {
-            app.endChat()
-          }
+          app.endChat()
           return
         }
         app.appendChatToken(chars[i])

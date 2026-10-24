@@ -243,7 +243,6 @@ export function mapEvent(payload: ZCodePetEventPayload): NotificationSpec | null
           fullText: fullResponse,
           severity: 'info',
           minDisplayMs: DEFAULT_MIN_DISPLAY_MS,
-          appendTokenStats: true,
         }
       }
       // 无 AI 响应消息：可能模型请求失败或被中断，用 failed 动画提示异常结束。
@@ -252,7 +251,6 @@ export function mapEvent(payload: ZCodePetEventPayload): NotificationSpec | null
         messageKey: 'notif.stop.empty',
         severity: 'warn',
         minDisplayMs: DEFAULT_MIN_DISPLAY_MS,
-        appendTokenStats: true,
       }
     }
 
