@@ -43,6 +43,8 @@ const TICK_INTERVAL_MS = 120
 const MIN_MIGRATE_GAP_MS = 600
 /** 宠物足迹半宽 + 侧边距（与 viewport.ts 的 footprint(72)+SIDE(16) 一致）。 */
 const PADDING = 88
+// ponytail: 显示器数量 TTL 缓存——热插显示器最多延迟 30s 生效；需要即时可改监听 monitor 变化事件
+const MONITOR_COUNT_TTL_MS = 30_000
 
 /**
  * 创建跨屏迁移器。返回 tick()，由引擎 ticker 周期调用（内部按 TICK_INTERVAL_MS 节流）。
@@ -52,6 +54,8 @@ export function createCrossMonitorMigrator(deps: MigratorDeps) {
   let lastTickAt = 0
   let lastMigrateAt = 0
   let migrating = false
+  let monitorCount: number | null = null
+  let monitorCountAt = 0
 
   async function tick(): Promise<void> {
     if (migrating) return
@@ -62,25 +66,31 @@ export function createCrossMonitorMigrator(deps: MigratorDeps) {
 
     try {
       // 1. 宠物当前画布坐标 + 活动边界（clamp 后的实际可达范围）。
+      //    边缘检测纯本地——绝大多数 tick 宠物在屏幕中部，到此返回，零 IPC。
       const pos = deps.pet.getSnapshotForMigration()
       const bounds = deps.pet.migrationBounds
       if (!pos || !bounds) return
 
-      // 2. 窗口物理原点 + scale + 当前所在屏 + 显示器列表。
-      const [origin, winScale, winMonitor, allMonitors] = await Promise.all([
-        win.outerPosition(),
-        win.scaleFactor(),
-        currentMonitor(),
-        availableMonitors(),
-      ])
-      if (winScale <= 0 || !winMonitor || allMonitors.length <= 1) return
-
-      // 3. 判断宠物是否贴近活动边界的某条边。
       const atLeftEdge = pos.x <= bounds.minX + EDGE_TRIGGER_PX
       const atRightEdge = pos.x >= bounds.maxX - EDGE_TRIGGER_PX
       const atTopEdge = pos.y <= bounds.minY + EDGE_TRIGGER_PX
       const atBottomEdge = pos.y >= bounds.maxY - EDGE_TRIGGER_PX
       if (!atLeftEdge && !atRightEdge && !atTopEdge && !atBottomEdge) return
+
+      // 2. 显示器数量（TTL 缓存）：单屏机器贴边也无需任何窗口 IPC。
+      if (monitorCount === null || now - monitorCountAt > MONITOR_COUNT_TTL_MS) {
+        monitorCount = (await availableMonitors()).length
+        monitorCountAt = now
+      }
+      if (monitorCount <= 1) return
+
+      // 3. 窗口物理原点 + scale + 当前所在屏。
+      const [origin, winScale, winMonitor] = await Promise.all([
+        win.outerPosition(),
+        win.scaleFactor(),
+        currentMonitor(),
+      ])
+      if (winScale <= 0 || !winMonitor) return
 
       // 4. 探测当前屏边缘「物理外侧」是否有邻屏。
       //    探测点必须在当前屏物理边界之外（monLeft-1 等），否则仍在当前屏内。

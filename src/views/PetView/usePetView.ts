@@ -7,7 +7,7 @@
  */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { getCurrentWindow } from '@tauri-apps/api/window'
+import { getCurrentWindow, cursorPosition } from '@tauri-apps/api/window'
 import { invoke } from '@tauri-apps/api/core'
 import { usePetSettingsStore } from '@/stores/petSettings'
 import { useDesktopPetStore } from '@/stores/desktopPet'
@@ -36,6 +36,9 @@ import { useZCodePetEvents } from '@/composables/useZCodePetEvents'
 const DRAG_THRESHOLD_PX = 5
 // click-through 轮询间隔（ms）。穿透态下窗口收不到 pointermove，故用轮询检测光标位置。
 const CLICKTHROUGH_POLL_MS = 60
+// 窗口几何（原点 + scale）刷新间隔（ms）。全屏覆盖窗原点仅在跨屏迁移时变化，
+// 无需每 60ms 拉取—— ponytail: 2s 慢刷新兜底；需要即时可在迁移回调里主动失效。
+const GEOM_REFRESH_MS = 2_000
 // 模拟 SSE 节奏（ms/token）。
 const SIM_TOKEN_INTERVAL_MS = 70
 // 移出宠物后对话气泡停留时间再淡出（ms）。
@@ -119,6 +122,9 @@ export function usePetView() {
   let clickThroughTimer: ReturnType<typeof setInterval> | null = null
   let currentIgnoreState: boolean | null = null
   let hovering = false
+  // 窗口几何缓存（原点 + scale），按 GEOM_REFRESH_MS 慢刷新。
+  let geomCache: { originX: number; originY: number; scale: number } | null = null
+  let geomFetchedAt = 0
 
   // --- 模拟 SSE 状态 ----------------------------------------------------
   let chatTimer: ReturnType<typeof setInterval> | null = null
@@ -533,25 +539,33 @@ export function usePetView() {
 
   /**
    * click-through 轮询：每 ~60ms 检测光标是否在宠物包围盒内。
+   *
+   * 每次仅拉取光标位置（1 次 IPC）；窗口原点 / scale 用 GEOM_REFRESH_MS 慢刷新缓存——
+   * 全屏覆盖窗原点只在跨屏迁移时变化，无需跟轮询同频。
    */
   async function pollClickThrough(): Promise<void> {
     const app = petApp.value
     if (!app) return
+    if (document.hidden) return
     if (pointerArmed.value || dragging.value || actionMenuVisible.value || contextMenuVisible.value) {
       await setIgnoreCursorEvents(false)
       return
     }
 
     try {
-      const [cursor, origin, scale] = await Promise.all([
-        import('@tauri-apps/api/window').then((m) => m.cursorPosition()),
-        win.outerPosition(),
-        win.scaleFactor()
-      ])
-      if (scale <= 0) return
+      const cursor = await cursorPosition()
+      if (Date.now() - geomFetchedAt > GEOM_REFRESH_MS || !geomCache) {
+        const [origin, scale] = await Promise.all([win.outerPosition(), win.scaleFactor()])
+        if (scale > 0) {
+          geomCache = { originX: origin.x, originY: origin.y, scale }
+          geomFetchedAt = Date.now()
+        }
+      }
+      const g = geomCache
+      if (!g) return
 
-      const localX = (cursor.x - origin.x) / scale
-      const localY = (cursor.y - origin.y) / scale
+      const localX = (cursor.x - g.originX) / g.scale
+      const localY = (cursor.y - g.originY) / g.scale
 
       const b = app.getPetBounds()
       const inside = localX >= b.minX && localX <= b.maxX && localY >= b.minY && localY <= b.maxY
@@ -655,6 +669,25 @@ export function usePetView() {
     if (tokenAutoTimer) {
       clearInterval(tokenAutoTimer)
       tokenAutoTimer = null
+    }
+  }
+
+  // --- 窗口隐藏休眠 --------------------------------------------------------
+
+  /**
+   * 窗口隐藏（托盘 / 管理页 / 右键菜单）时挂起全部轮询循环，重新显示时恢复。
+   * 原生 visibilitychange：macOS WKWebView 隐藏窗口后 document.hidden 置位，无需后端事件。
+   */
+  function handleVisibilityChange(): void {
+    if (document.hidden) {
+      stopClickThroughLoop()
+      stopIdleChecker()
+      stopTokenAutoTimer()
+    } else {
+      startClickThroughLoop()
+      startIdleChecker()
+      startTokenAutoTimer()
+      void pollClickThrough()
     }
   }
 
@@ -762,6 +795,7 @@ export function usePetView() {
     startIdleChecker()
     startTokenAutoTimer()
     lastInteractionAt = Date.now()
+    document.addEventListener('visibilitychange', handleVisibilityChange)
   })
 
   // petSettings.activeId 被外部（管理窗口）改写时，若引擎已就绪则切换。
@@ -795,6 +829,7 @@ export function usePetView() {
     window.removeEventListener('pointermove', handleWindowPointerMove, true)
     window.removeEventListener('pointerup', handleWindowPointerUp, true)
     window.removeEventListener('pointerdown', handleGlobalPointerDown, true)
+    document.removeEventListener('visibilitychange', handleVisibilityChange)
     stopClickThroughLoop()
     stopIdleChecker()
     stopTokenAutoTimer()

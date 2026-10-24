@@ -4,7 +4,7 @@
  * 职责：
  *   1. 监听后端 `zcode-pet:event` 事件（{@link ZCodePetEventPayload}）。
  *   2. 经 {@link mapEvent} 映射为 {@link NotificationSpec}，入 {@link createNotificationQueue} 队列。
- *   3. 用 `requestAnimationFrame` ticker 每帧推进队列状态机（防抖 + error 抢断）。
+ *   3. 用 250ms 定时器周期推进队列状态机（防抖 + error 抢断）。
  *   4. 队列产出（新）spec 时：用 i18n 渲染文案 → 驱动宠物动画 + ChatBubble
  *      （打字机逐字 / error 即时全文）→ 展示总时长后淡出隐藏。
  *
@@ -42,6 +42,8 @@ const TYPEWRITER_INTERVAL_MS = 55
 const DISPLAY_MS_PER_CHAR = 70
 /** 展示总时长上限（ms），避免超长文本气泡停留过久。 */
 const DISPLAY_TOTAL_MAX_MS = 16000
+/** 队列推进间隔（ms）。队列自身时间分辨率为 minDisplayMs（2200ms），250ms 足够。 */
+const TICK_INTERVAL_MS = 250
 
 /**
  * 格式化 token 数为简短可读形式（适合气泡展示）。
@@ -91,7 +93,9 @@ export function useZCodePetEvents(petAppRef: Ref<PetApp | null>) {
   let displayedSpec: NotificationSpec | null = null
   let typewriterTimer: ReturnType<typeof setInterval> | null = null
   let hideTimer: ReturnType<typeof setTimeout> | null = null
-  let rafId: number | null = null
+  // 队列推进定时器。队列时间分辨率即 minDisplayMs（2200ms），无需 rAF 60Hz；
+  // 250ms 粒度足够（pending 提升最多延迟 250ms，用户无感），空转唤醒也少两个数量级。
+  let tickTimer: ReturnType<typeof setInterval> | null = null
   let unlistenFn: (() => void) | null = null
 
   /** 清理打字机与隐藏定时器（不触碰 raf / unlisten）。 */
@@ -171,7 +175,7 @@ export function useZCodePetEvents(petAppRef: Ref<PetApp | null>) {
   }
 
   /**
-   * ticker：每帧推进队列状态机；当队列产出新 spec（引用变化）时重新触发打字机 + 动画。
+   * 队列推进：每 250ms 推进队列状态机；当队列产出新 spec（引用变化）时重新触发打字机 + 动画。
    */
   function onTick(): void {
     const now = performance.now()
@@ -180,7 +184,6 @@ export function useZCodePetEvents(petAppRef: Ref<PetApp | null>) {
       isActive.value = true
       startTyping(spec)
     }
-    rafId = requestAnimationFrame(onTick)
   }
 
   onMounted(async () => {
@@ -190,15 +193,15 @@ export function useZCodePetEvents(petAppRef: Ref<PetApp | null>) {
       isActive.value = true
       queue.push(spec, performance.now())
     })
-    rafId = requestAnimationFrame(onTick)
+    tickTimer = setInterval(onTick, TICK_INTERVAL_MS)
   })
 
   onUnmounted(() => {
     unlistenFn?.()
     unlistenFn = null
-    if (rafId !== null) {
-      cancelAnimationFrame(rafId)
-      rafId = null
+    if (tickTimer !== null) {
+      clearInterval(tickTimer)
+      tickTimer = null
     }
     clearTimers()
     queue.clear()
