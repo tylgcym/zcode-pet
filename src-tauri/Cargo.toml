@@ -59,6 +59,13 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # MCP Bridge（仅 debug 构建启用，供 Tauri MCP 端到端测试）
 tauri-plugin-mcp-bridge = "0.12"
 
+# macOS 光标全局逻辑坐标读取（tao cursor_position 在混合 DPI 多屏下按主屏 scale
+# 换算，副屏坐标错误 → 点击穿透检测失效；直接用 NSEvent/NSScreen 自行换算）。
+# 已在依赖树中（tao/wry 使用），仅为直接调用声明。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+
 [profile.dev]
 debug = 1
 

@@ -64,6 +64,11 @@ export interface PetApp {
    * 由前端 click-through 轮询驱动（穿透态下窗口收不到 pointermove）。
    */
   onPetHoverChange?: (inside: boolean) => void
+  /**
+   * 跨屏迁移完成回调（窗口已移到另一显示器并重定位宠物）。窗口瞬移意味着进行中的
+   * 指针手势必然作废（pointerup 不会再到达本窗口），视图应据此复位拖拽状态。
+   */
+  onPetMigrated?: () => void
   // --- 对话气泡（模拟 SSE，后续接入 ACP）-------------------------------
   /** 开始流式对话输出。 */
   showChat: () => void
@@ -164,9 +169,16 @@ export async function createPetApp(
   }
 
   // 跨屏迁移器（仅悬浮窗模式）：检测宠物进入相邻屏 → 迁移窗口 + 重映射坐标。
+  // petApp 在下方定义；本闭包仅在迁移发生时（初始化完成后）执行，引用安全。
   const migrator = preview
     ? null
-    : createCrossMonitorMigrator({ pet, onMigrated: syncViewport })
+    : createCrossMonitorMigrator({
+        pet,
+        onMigrated: () => {
+          syncViewport()
+          petApp.onPetMigrated?.()
+        },
+      })
 
   // 悬浮窗模式：DOM resize + Tauri 窗口 onResized/onScaleChanged 三路保险。
   // 后两者覆盖「拔插显示器 / 改分辨率 / 跨屏拖动导致窗口尺寸变化」等 Pixi 自动 resize 未捕获的场景。

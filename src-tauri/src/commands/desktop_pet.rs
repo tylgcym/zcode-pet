@@ -1094,6 +1094,165 @@ fn position_fullscreen_and_report(
     Ok((origin_x, origin_y, logical_w, logical_h, scale))
 }
 
+/// 光标在宠物窗口内的局部 CSS px 坐标（顶左原点）。
+///
+/// 背景根因：tao 的 `cursor_position()`（macOS）把 `NSEvent.mouseLocation`（全局逻辑
+/// points）一律乘【主屏】scale 转物理——混合 DPI 双屏（主屏 Retina 2x + 副屏 1x）下，
+/// 光标在副屏时坐标整体错误，前端点击穿透检测恒判"不在宠物上"，宠物在副屏不可交互。
+/// 此命令改为直接读 NSEvent + NSScreen 的逻辑坐标，按宠物窗口所在屏做本地换算，
+/// 全程逻辑坐标（CSS px = points），不经过物理坐标，天然免疫混合 DPI。
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+pub struct CursorLocal {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// 屏幕逻辑几何（AppKit 全局坐标：主屏左下为原点，y 向上，单位 points）。 */
+#[derive(Clone, Debug)]
+struct ScreenLogicalFrame {
+    name: String,
+    origin_x: f64,
+    origin_y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// 全局逻辑光标 → 指定屏内顶左原点局部坐标（即窗口 CSS px，宠物窗口恒铺满所在屏）。
+fn cursor_local_on_frame(cursor_x: f64, cursor_y: f64, f: &ScreenLogicalFrame) -> (f64, f64) {
+    (cursor_x - f.origin_x, (f.origin_y + f.height) - cursor_y)
+}
+
+/// macOS：读全局光标逻辑坐标 + 各屏逻辑 frame（名称与 tauri Monitor::name 一致，
+/// 均为 NSScreen.localizedName）。
+#[cfg(target_os = "macos")]
+fn macos_cursor_and_screens() -> Option<((f64, f64), Vec<ScreenLogicalFrame>)> {
+    use objc2::class;
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSPoint, NSRect};
+    use std::ffi::{c_char, CStr};
+
+    unsafe {
+        let pt: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+
+        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+        if screens.is_null() {
+            return None;
+        }
+        let count: usize = msg_send![screens, count];
+        let mut frames = Vec::with_capacity(count);
+        for i in 0..count {
+            let screen: *mut AnyObject = msg_send![screens, objectAtIndex: i];
+            if screen.is_null() {
+                continue;
+            }
+            let frame: NSRect = msg_send![screen, frame];
+            let name_obj: *mut AnyObject = msg_send![screen, localizedName];
+            let name = if name_obj.is_null() {
+                String::new()
+            } else {
+                let utf8: *const c_char = msg_send![name_obj, UTF8String];
+                if utf8.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(utf8).to_string_lossy().into_owned()
+                }
+            };
+            frames.push(ScreenLogicalFrame {
+                name,
+                origin_x: frame.origin.x,
+                origin_y: frame.origin.y,
+                width: frame.size.width,
+                height: frame.size.height,
+            });
+        }
+        Some(((pt.x, pt.y), frames))
+    }
+}
+
+#[tauri::command]
+pub fn get_cursor_local(app: AppHandle) -> Result<CursorLocal, String> {
+    let window = app
+        .get_webview_window(PET_WINDOW_LABEL)
+        .ok_or_else(|| "宠物窗口不存在".to_string())?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let (cursor, frames) = macos_cursor_and_screens().ok_or("读取鼠标/屏幕信息失败")?;
+        // 宠物窗口所在屏（名称匹配 NSScreen），无名/不匹配时退回第一块屏。
+        let current_name = window
+            .current_monitor()
+            .map_err(|e| format!("获取当前显示器失败: {}", e))?
+            .and_then(|m| m.name().map(|n| n.to_string()));
+        let frame = current_name
+            .as_deref()
+            .and_then(|name| frames.iter().find(|f| f.name == name))
+            .or_else(|| frames.first())
+            .ok_or("未找到可用显示器")?;
+        let (x, y) = cursor_local_on_frame(cursor.0, cursor.1, frame);
+        Ok(CursorLocal { x, y })
+    }
+
+    // Windows/Linux：tao 的 cursor_position 为正确的物理坐标，按窗口原点 + scale 换算即可。
+    #[cfg(not(target_os = "macos"))]
+    {
+        let scale = window.scale_factor().map_err(|e| format!("获取 scale 失败: {}", e))?;
+        if scale <= 0.0 {
+            return Err("非法 scale factor".to_string());
+        }
+        let cursor = app.cursor_position().map_err(|e| format!("获取光标失败: {}", e))?;
+        let origin = window.outer_position().map_err(|e| format!("获取窗口原点失败: {}", e))?;
+        Ok(CursorLocal {
+            x: (cursor.x - origin.x) as f64 / scale,
+            y: (cursor.y - origin.y) as f64 / scale,
+        })
+    }
+}
+
+#[cfg(test)]
+mod cursor_local_tests {
+    use super::*;
+
+    fn frame(name: &str, x: f64, y: f64, w: f64, h: f64) -> ScreenLogicalFrame {
+        ScreenLogicalFrame {
+            name: name.to_string(),
+            origin_x: x,
+            origin_y: y,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn mixed_dpi_secondary_screen_center() {
+        // 混合 DPI 布局：主屏 Retina 1280x832（origin 0,0），副屏 1920x1200 在其右侧
+        // （AppKit 逻辑坐标 origin (1280, -184)，顶部与主屏对齐）。
+        let sec = frame("DELL", 1280.0, -184.0, 1920.0, 1200.0);
+        // 光标在副屏正中：全局逻辑 (1280+960, -184+600)。
+        // tao 会错误地把它乘主屏 scale 2.0 → 4480；本实现按屏换算应得 (960, 600)。
+        let (lx, ly) = cursor_local_on_frame(2240.0, 416.0, &sec);
+        assert!((lx - 960.0).abs() < 1e-9, "lx={lx}");
+        assert!((ly - 600.0).abs() < 1e-9, "ly={ly}");
+    }
+
+    #[test]
+    fn main_screen_top_left_region() {
+        let main = frame("Built-in", 0.0, 0.0, 1280.0, 832.0);
+        // 光标在主屏左上角附近（顶部下方 20pt）。
+        let (lx, ly) = cursor_local_on_frame(10.0, 832.0 - 20.0, &main);
+        assert!((lx - 10.0).abs() < 1e-9);
+        assert!((ly - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cursor_below_screen_origin_still_maps_top_down() {
+        // 光标 y 超出屏底（副屏比主屏低），局部 y 应大于屏高（在窗口下方）。
+        let sec = frame("DELL", 1280.0, -184.0, 1920.0, 1200.0);
+        let (_, ly) = cursor_local_on_frame(1500.0, -300.0, &sec);
+        assert!(ly > 1200.0, "ly={ly}");
+    }
+}
+
 // --- 命令：市场网络代理 --------------------------------------------------
 
 /// 读取当前市场代理配置。

@@ -7,7 +7,7 @@
  */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { getCurrentWindow, cursorPosition } from '@tauri-apps/api/window'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { invoke } from '@tauri-apps/api/core'
 import { usePetSettingsStore } from '@/stores/petSettings'
 import { useDesktopPetStore } from '@/stores/desktopPet'
@@ -36,9 +36,6 @@ import { useZCodePetEvents } from '@/composables/useZCodePetEvents'
 const DRAG_THRESHOLD_PX = 5
 // click-through 轮询间隔（ms）。穿透态下窗口收不到 pointermove，故用轮询检测光标位置。
 const CLICKTHROUGH_POLL_MS = 60
-// 窗口几何（原点 + scale）刷新间隔（ms）。全屏覆盖窗原点仅在跨屏迁移时变化，
-// 无需每 60ms 拉取—— ponytail: 2s 慢刷新兜底；需要即时可在迁移回调里主动失效。
-const GEOM_REFRESH_MS = 2_000
 // 模拟 SSE 节奏（ms/token）。
 const SIM_TOKEN_INTERVAL_MS = 70
 // 移出宠物后对话气泡停留时间再淡出（ms）。
@@ -122,9 +119,6 @@ export function usePetView() {
   let clickThroughTimer: ReturnType<typeof setInterval> | null = null
   let currentIgnoreState: boolean | null = null
   let hovering = false
-  // 窗口几何缓存（原点 + scale），按 GEOM_REFRESH_MS 慢刷新。
-  let geomCache: { originX: number; originY: number; scale: number } | null = null
-  let geomFetchedAt = 0
 
   // --- 模拟 SSE 状态 ----------------------------------------------------
   let chatTimer: ReturnType<typeof setInterval> | null = null
@@ -181,6 +175,8 @@ export function usePetView() {
 
       // 鼠标进入宠物 → 触发模拟对话；离开宠物 → 停止流式并淡出隐藏。
       petApp.value.onPetHoverChange = handleHoverChange
+      // 跨屏迁移完成 → 复位拖拽手势（pointerup 因窗口瞬移而丢失）。
+      petApp.value.onPetMigrated = handlePetMigrated
       // 应用持久化的漫游模式（固定时不走步，只停在原地）。
       petApp.value.setMovementMode(petSettings.movementMode)
       isLoading.value = false
@@ -223,6 +219,7 @@ export function usePetView() {
         config: { scale: petSettings.scale / 100 }
       })
       app.onPetHoverChange = handleHoverChange
+      app.onPetMigrated = handlePetMigrated
       // 重建后重新应用漫游模式（与 bootPetApp 保持一致）。
       app.setMovementMode(petSettings.movementMode)
       petApp.value = app
@@ -540,8 +537,9 @@ export function usePetView() {
   /**
    * click-through 轮询：每 ~60ms 检测光标是否在宠物包围盒内。
    *
-   * 每次仅拉取光标位置（1 次 IPC）；窗口原点 / scale 用 GEOM_REFRESH_MS 慢刷新缓存——
-   * 全屏覆盖窗原点只在跨屏迁移时变化，无需跟轮询同频。
+   * 光标局部坐标由 Rust `get_cursor_local` 计算（单次 IPC）：macOS 上不使用 tauri
+   * cursorPosition（底层 tao 在混合 DPI 多屏下按主屏 scale 换算，副屏坐标错误），
+   * 而是直接读 NSEvent/NSScreen 逻辑坐标按窗口所在屏换算，CSS px 直出。
    */
   async function pollClickThrough(): Promise<void> {
     const app = petApp.value
@@ -553,22 +551,10 @@ export function usePetView() {
     }
 
     try {
-      const cursor = await cursorPosition()
-      if (Date.now() - geomFetchedAt > GEOM_REFRESH_MS || !geomCache) {
-        const [origin, scale] = await Promise.all([win.outerPosition(), win.scaleFactor()])
-        if (scale > 0) {
-          geomCache = { originX: origin.x, originY: origin.y, scale }
-          geomFetchedAt = Date.now()
-        }
-      }
-      const g = geomCache
-      if (!g) return
-
-      const localX = (cursor.x - g.originX) / g.scale
-      const localY = (cursor.y - g.originY) / g.scale
+      const local = await invoke<{ x: number; y: number }>('get_cursor_local')
 
       const b = app.getPetBounds()
-      const inside = localX >= b.minX && localX <= b.maxX && localY >= b.minY && localY <= b.maxY
+      const inside = local.x >= b.minX && local.x <= b.maxX && local.y >= b.minY && local.y <= b.maxY
 
       await setIgnoreCursorEvents(!inside)
       if (inside !== hovering) {
@@ -701,6 +687,19 @@ export function usePetView() {
       startSimulatedChat()
     } else {
       stopSimulatedChat()
+    }
+  }
+
+  /**
+   * 跨屏迁移完成：窗口瞬移后光标已不在窗口内，进行中的拖拽手势的 pointerup
+   * 永远不会到达本窗口——强制复位武装/拖拽状态并恢复大脑漫游，避免卡死在
+   * "拖拽中"（那会让 click-through 轮询把整屏长期置为可交互，挡住其他应用点击）。
+   */
+  function handlePetMigrated(): void {
+    if (pointerArmed.value || dragging.value) {
+      pointerArmed.value = false
+      dragging.value = false
+      petApp.value?.endDrag()
     }
   }
 

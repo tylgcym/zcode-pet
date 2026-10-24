@@ -139,6 +139,8 @@ pub fn run() {
             desktop_pet::set_pet_always_on_top,
             // 多屏漫游：跨屏时迁移窗口到目标显示器
             desktop_pet::move_pet_window_to_monitor,
+            // 点击穿透检测：光标在宠物窗口内的局部坐标（混合 DPI 多屏正确换算）
+            desktop_pet::get_cursor_local,
             // ZCode hook 联动
             desktop_pet::link_zcode,
             desktop_pet::get_zcode_link_status,
